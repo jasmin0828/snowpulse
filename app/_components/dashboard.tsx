@@ -2,7 +2,7 @@
 
 import { useState, type CSSProperties } from "react";
 import type { DataFreshness } from "../../src/lib/avalanche/metrics";
-import type { DashboardData } from "../../src/lib/dashboard/data";
+import type { DashboardData } from "../../src/lib/dashboard/types";
 import { freshnessSummary, prepareDashboardViewModel } from "../../src/lib/dashboard/view-model";
 import type { ChainSignal, MetricComparison } from "../../src/lib/intelligence/scoring";
 
@@ -124,19 +124,19 @@ function FreshnessStrip({ freshness, sourceState }: { freshness: DataFreshness; 
       <div className="freshness-main">
         <span className="freshness-icon" aria-hidden="true"><span /></span>
         <div>
-          <p className="strip-label">{summary.primary}</p>
+          <p className="strip-label">{sourceState === "UNAVAILABLE" ? "Live data unavailable" : summary.primary}</p>
           <p className="strip-value">
             {freshness.selectedTimestamp === "MISSING"
-              ? "Ranking unavailable"
+              ? sourceState === "UNAVAILABLE" ? "No verified data available" : "Ranking unavailable"
               : `${formatDate(freshness.selectedTimestamp)} UTC`}
           </p>
         </div>
       </div>
       <div className="freshness-detail">
-        <span className="detail-label">Latest available</span>
+        <span className="detail-label">{sourceState === "SNAPSHOT DATA" ? "Snapshot source" : "Latest available"}</span>
         <span className="detail-value">
-          {formatDate(freshness.latestAvailableTimestamp)}
-          {freshness.latestAvailableState === "PROVISIONAL" ? <em>provisional</em> : null}
+          {sourceState === "SNAPSHOT DATA" ? "Verified Avalanche API capture" : formatDate(freshness.latestAvailableTimestamp)}
+          {sourceState !== "SNAPSHOT DATA" && freshness.latestAvailableState === "PROVISIONAL" ? <em>provisional</em> : null}
         </span>
       </div>
       <div className="freshness-source"><span className="live-dot" />{sourceState}</div>
@@ -245,7 +245,18 @@ function SignalDetail({ signal }: { signal: ChainSignal }) {
   );
 }
 
-function UncertainState() {
+function DataQualityState({ sourceState }: { sourceState: DashboardData["sourceState"] }) {
+  if (sourceState === "UNAVAILABLE") {
+    return (
+      <div className="uncertain-state" role="status">
+        <span className="uncertain-icon">!</span>
+        <div>
+          <strong>Current Avalanche metrics are unavailable.</strong>
+          <p>No live data or verified snapshot is available. Ranking is withheld.</p>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="uncertain-state" role="status">
       <span className="uncertain-icon">!</span>
@@ -295,7 +306,7 @@ export default function Dashboard({ data }: { data: DashboardData }) {
             <div><p className="eyebrow">Discovery layer</p><h2 id="signals-title">Activity Signals</h2></div>
             <p>Ranked by change in transactions and participant activity<br className="desktop-break" /> versus the prior 7-day baseline.</p>
           </div>
-          {viewModel.withholdRanking ? <UncertainState /> : (
+          {viewModel.withholdRanking ? <DataQualityState sourceState={data.sourceState} /> : (
             <div className="signals-layout">
               <div className="signals-list" aria-label="Ranked Avalanche L1 activity signals">
                 {viewModel.rankedSignals.map((signal, index) => (

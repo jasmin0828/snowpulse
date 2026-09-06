@@ -6,8 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test": "node --experimental-strip-types --experimental-default-type=module --test tests/intelligence.test.ts tests/dashboard.test.ts",
-    "gate2": "node --experimental-strip-types --experimental-default-type=module scripts/gate2-intelligence.ts"
+    "test": "node --experimental-strip-types --experimental-default-type=module --test tests/intelligence.test.ts tests/dashboard.test.ts tests/resilience.test.ts",
+    "gate2": "node --experimental-strip-types --experimental-default-type=module scripts/gate2-intelligence.ts",
+    "snapshot": "node --experimental-strip-types --experimental-default-type=module scripts/generate-snapshot.ts"
   },
   "dependencies": {
     "next": "^15.5.2",

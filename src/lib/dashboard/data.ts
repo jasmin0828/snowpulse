@@ -1,66 +1,43 @@
-import {
-  DAY_SECONDS,
-  fetchDailyMetricSeries,
-  fetchMainnetChains,
-  fetchRollingMetricSeries,
-  utcDayStartSeconds,
-  type AvalancheChain,
-  type CoreMetricSeries,
-  type CoreRollingMetricSeries,
-  type DataFreshness,
-} from "../avalanche/metrics.ts";
-import { buildIntelligenceSignals } from "../intelligence/engine.ts";
-import type { ChainSignal } from "../intelligence/scoring.ts";
+import type { DataFreshness } from "../avalanche/metrics.ts";
+import { loadLiveDashboardData } from "./live.ts";
+import { readSnowPulseSnapshot, snapshotToDashboardData, type SnowPulseSnapshot } from "./snapshot.ts";
+import { FROZEN_DEMO_CHAIN_IDS, type DashboardData } from "./types.ts";
 
-export const FROZEN_DEMO_CHAIN_IDS = [4337, 432204, 46975, 43419] as const;
+export { FROZEN_DEMO_CHAIN_IDS } from "./types.ts";
 
-export type DashboardData = {
-  sourceState: "LIVE DATA" | "SNAPSHOT DATA";
-  monitoredL1Count: number;
-  signals: ChainSignal[];
-  freshness: DataFreshness;
+export type DashboardLoaderDependencies = {
+  liveLoader?: (nowMs: number) => Promise<DashboardData>;
+  snapshotLoader?: () => SnowPulseSnapshot | null;
 };
 
-function frozenChainsFrom(
-  chains: AvalancheChain[],
-): AvalancheChain[] {
-  return FROZEN_DEMO_CHAIN_IDS.map((chainId) => chains.find(
-    (chain) => chain.evmChainId === chainId && chain.network === "mainnet",
-  )).filter((chain): chain is NonNullable<typeof chain> => Boolean(chain));
+function unavailableFreshness(): DataFreshness {
+  return {
+    selectedTimestamp: "MISSING",
+    latestAvailableTimestamp: "MISSING",
+    state: "UNCERTAIN",
+    usedFallbackBucket: false,
+    latestAvailableState: null,
+    reason: "Live Avalanche metrics were unusable and no valid real snapshot was available.",
+  };
 }
 
-export async function loadDashboardData(nowMs = Date.now()): Promise<DashboardData> {
-  const chainList = await fetchMainnetChains();
-  const frozenChains = frozenChainsFrom(chainList.chains);
-  if (chainList.evidence.status !== 200 || frozenChains.length !== FROZEN_DEMO_CHAIN_IDS.length) {
-    throw new Error("The official Avalanche Mainnet chain list is unavailable or incomplete.");
-  }
-
-  const endTimestamp = utcDayStartSeconds(nowMs);
-  const startTimestamp = endTimestamp - 14 * DAY_SECONDS;
-  const seriesByChain: Record<number, CoreMetricSeries> = {};
-  const rollingByChain: Record<number, CoreRollingMetricSeries> = {};
-
-  await Promise.all(frozenChains.map(async (chain) => {
-    const [series, rolling] = await Promise.all([
-      fetchDailyMetricSeries(chain.evmChainId, startTimestamp, endTimestamp),
-      fetchRollingMetricSeries(chain.evmChainId),
-    ]);
-    seriesByChain[chain.evmChainId] = series;
-    rollingByChain[chain.evmChainId] = rolling;
-  }));
-
-  const { signals, selection } = buildIntelligenceSignals(
-    frozenChains,
-    seriesByChain,
-    rollingByChain,
-    nowMs,
-  );
-
+export function unavailableDashboardData(): DashboardData {
   return {
-    sourceState: "LIVE DATA",
-    monitoredL1Count: frozenChains.length,
-    signals,
-    freshness: selection.freshness,
+    sourceState: "UNAVAILABLE",
+    monitoredL1Count: FROZEN_DEMO_CHAIN_IDS.length,
+    signals: [],
+    freshness: unavailableFreshness(),
   };
+}
+
+export async function loadDashboardData(
+  nowMs = Date.now(),
+  dependencies: DashboardLoaderDependencies = {},
+): Promise<DashboardData> {
+  try {
+    return await (dependencies.liveLoader ?? loadLiveDashboardData)(nowMs);
+  } catch {
+    const snapshot = (dependencies.snapshotLoader ?? readSnowPulseSnapshot)();
+    return snapshot ? snapshotToDashboardData(snapshot) : unavailableDashboardData();
+  }
 }
