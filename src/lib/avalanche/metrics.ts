@@ -32,6 +32,25 @@ export type MetricSeries = {
 
 export type CoreMetricSeries = Record<CoreMetricName, MetricSeries>;
 
+export type RollingMetricSeries = {
+  lastDay: number | null;
+  request: RequestEvidence;
+};
+
+export type CoreRollingMetricSeries = Record<CoreMetricName, RollingMetricSeries>;
+
+export type DataFreshnessState = "STABLE" | "PROVISIONAL" | "UNCERTAIN";
+export type DailyBucketState = "AVAILABLE" | "PROVISIONAL" | "STABLE";
+
+export type DataFreshness = {
+  selectedTimestamp: string;
+  latestAvailableTimestamp: string;
+  state: DataFreshnessState;
+  usedFallbackBucket: boolean;
+  latestAvailableState: DailyBucketState | null;
+  reason?: string;
+};
+
 export type ComparableWindow = {
   currentTimestamp: number | null;
   baselineTimestamps: number[];
@@ -75,6 +94,12 @@ function parsePoints(value: unknown): DailyMetricPoint[] {
   });
 }
 
+function parseRollingLastDay(value: unknown): number | null {
+  if (!isJsonRecord(value)) return null;
+  const result = isJsonRecord(value.result) ? value.result : value;
+  return parseNumber(result.lastDay);
+}
+
 export function utcDayStartSeconds(nowMs = Date.now()): number {
   return Math.floor(nowMs / 1000 / DAY_SECONDS) * DAY_SECONDS;
 }
@@ -90,6 +115,10 @@ export function dailyMetricsUrl(
   endTimestamp: number,
 ): string {
   return `${AVALANCHE_METRICS_BASE_URL}/v2/chains/${chainId}/metrics/${metric}?startTimestamp=${startTimestamp}&endTimestamp=${endTimestamp}&timeInterval=day&pageSize=20`;
+}
+
+export function rollingWindowMetricsUrl(chainId: number, metric: CoreMetricName): string {
+  return `${AVALANCHE_METRICS_BASE_URL}/v2/chains/${chainId}/rollingWindowMetrics/${metric}`;
 }
 
 export async function requestJson(
@@ -169,12 +198,205 @@ export async function fetchDailyMetricSeries(
   return Object.fromEntries(entries) as CoreMetricSeries;
 }
 
+export async function fetchRollingMetricSeries(
+  chainId: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<CoreRollingMetricSeries> {
+  const entries = await Promise.all(CORE_METRICS.map(async (metric) => {
+    const url = rollingWindowMetricsUrl(chainId, metric);
+    const response = await requestJson(url, 15_000, fetchImpl);
+    return [metric, { lastDay: parseRollingLastDay(response.body), request: response.evidence }] as const;
+  }));
+  return Object.fromEntries(entries) as CoreRollingMetricSeries;
+}
+
 function pointsByTimestamp(series: MetricSeries, beforeTimestamp: number): Map<number, number> {
   return new Map(
     series.points
       .filter((point) => point.timestamp < beforeTimestamp)
       .map((point) => [point.timestamp, point.value]),
   );
+}
+
+function commonDailyTimestamps(
+  chains: AvalancheChain[],
+  seriesByChain: Record<number, CoreMetricSeries>,
+  beforeTimestamp: number,
+): number[] {
+  const timestampSets = chains.flatMap((chain) => CORE_METRICS.map((metric) => {
+    const series = seriesByChain[chain.evmChainId]?.[metric];
+    return new Set(series ? pointsByTimestamp(series, beforeTimestamp).keys() : []);
+  }));
+  if (timestampSets.length === 0 || timestampSets.some((set) => set.size === 0)) return [];
+  return [...timestampSets[0]]
+    .filter((timestamp) => timestampSets.every((set) => set.has(timestamp)))
+    .sort((left, right) => right - left);
+}
+
+function rollingLastDay(
+  rollingByChain: Record<number, CoreRollingMetricSeries> | undefined,
+  chainId: number,
+): number | null {
+  return rollingByChain?.[chainId]?.txCount.lastDay ?? null;
+}
+
+export type StableBucketSelection = {
+  selectedTimestamp: number | null;
+  latestAvailableTimestamp: number | null;
+  freshness: DataFreshness;
+  severeDropChainIds: number[];
+  rollingInconsistentChainIds: number[];
+  rollingEvidenceComplete: boolean;
+};
+
+function makeFreshness(
+  selectedTimestamp: number | null,
+  latestAvailableTimestamp: number | null,
+  state: DataFreshnessState,
+  usedFallbackBucket: boolean,
+  latestAvailableState: DailyBucketState | null,
+  reason?: string,
+): DataFreshness {
+  return {
+    selectedTimestamp: formatUtcTimestamp(selectedTimestamp),
+    latestAvailableTimestamp: formatUtcTimestamp(latestAvailableTimestamp),
+    state,
+    usedFallbackBucket,
+    latestAvailableState,
+    ...(reason ? { reason } : {}),
+  };
+}
+
+/**
+ * Select the newest common daily bucket that is safe to use for cross-chain scoring.
+ * The freshness heuristic is intentionally limited to the newest bucket and txCount:
+ * participant metrics remain available for scoring, but are not required to flag
+ * an underfilled historical bucket.
+ */
+export function selectStableDailyBucket(
+  chains: AvalancheChain[],
+  seriesByChain: Record<number, CoreMetricSeries>,
+  rollingByChain: Record<number, CoreRollingMetricSeries> | undefined,
+  nowMs = Date.now(),
+): StableBucketSelection {
+  const currentDayStart = utcDayStartSeconds(nowMs);
+  const commonTimestamps = commonDailyTimestamps(chains, seriesByChain, currentDayStart);
+  const latestAvailableTimestamp = commonTimestamps[0] ?? null;
+  if (latestAvailableTimestamp === null) {
+    return {
+      selectedTimestamp: null,
+      latestAvailableTimestamp,
+      freshness: makeFreshness(
+        null,
+        null,
+        "UNCERTAIN",
+        false,
+        null,
+        "No common non-null daily bucket exists across all frozen chains and required metrics.",
+      ),
+      severeDropChainIds: [],
+      rollingInconsistentChainIds: [],
+      rollingEvidenceComplete: false,
+    };
+  }
+
+  const severeDropChainIds: number[] = [];
+  const rollingInconsistentChainIds: number[] = [];
+  let rollingEvidenceCount = 0;
+  for (const chain of chains) {
+    const txSeries = seriesByChain[chain.evmChainId]?.txCount;
+    const points = txSeries ? pointsByTimestamp(txSeries, currentDayStart) : new Map<number, number>();
+    const current = points.get(latestAvailableTimestamp);
+    const previous = points.get(latestAvailableTimestamp - DAY_SECONDS);
+    if (current !== undefined && previous !== undefined && previous > 0 && current < previous * 0.5) {
+      severeDropChainIds.push(chain.evmChainId);
+    }
+
+    const rolling = rollingLastDay(rollingByChain, chain.evmChainId);
+    if (rolling !== null && current !== undefined) {
+      rollingEvidenceCount += 1;
+      if (rolling > current * 2) rollingInconsistentChainIds.push(chain.evmChainId);
+    }
+  }
+
+  const evidenceThreshold = Math.min(3, chains.length);
+  const synchronizedCollapse = severeDropChainIds.length >= evidenceThreshold;
+  const rollingInconsistency = rollingInconsistentChainIds.length >= evidenceThreshold;
+  const rollingEvidenceComplete = chains.length > 0 && rollingEvidenceCount === chains.length;
+  const successorExists = commonTimestamps.includes(latestAvailableTimestamp + DAY_SECONDS);
+  const fallbackTimestamp = commonTimestamps.find((timestamp) => timestamp < latestAvailableTimestamp) ?? null;
+
+  if (!successorExists && synchronizedCollapse && (rollingInconsistency || !rollingEvidenceComplete)) {
+    if (fallbackTimestamp === null) {
+      return {
+        selectedTimestamp: null,
+        latestAvailableTimestamp,
+        freshness: makeFreshness(
+          null,
+          latestAvailableTimestamp,
+          "UNCERTAIN",
+          false,
+          "PROVISIONAL",
+          "The newest bucket is provisional, but no previous common bucket is available for a safe fallback.",
+        ),
+        severeDropChainIds,
+        rollingInconsistentChainIds,
+        rollingEvidenceComplete,
+      };
+    }
+    const evidenceReason = rollingEvidenceComplete
+      ? `Newest bucket ${formatUtcTimestamp(latestAvailableTimestamp)} is provisional: ${severeDropChainIds.length}/${chains.length} chains dropped below 50% of the previous daily txCount and ${rollingInconsistentChainIds.length}/${chains.length} rolling lastDay values exceed 2x historical txCount.`
+      : `Newest bucket ${formatUtcTimestamp(latestAvailableTimestamp)} is provisional: ${severeDropChainIds.length}/${chains.length} chains dropped below 50% of the previous daily txCount while rolling txCount evidence is incomplete.`;
+    return {
+      selectedTimestamp: fallbackTimestamp,
+      latestAvailableTimestamp,
+      freshness: makeFreshness(
+        fallbackTimestamp,
+        latestAvailableTimestamp,
+        "STABLE",
+        true,
+        "PROVISIONAL",
+        evidenceReason,
+      ),
+      severeDropChainIds,
+      rollingInconsistentChainIds,
+      rollingEvidenceComplete,
+    };
+  }
+
+  if (!rollingEvidenceComplete && !synchronizedCollapse) {
+    return {
+      selectedTimestamp: null,
+      latestAvailableTimestamp,
+      freshness: makeFreshness(
+        null,
+        latestAvailableTimestamp,
+        "UNCERTAIN",
+        false,
+        "AVAILABLE",
+        "Rolling txCount evidence is incomplete and historical data does not establish that the newest bucket is stable.",
+      ),
+      severeDropChainIds,
+      rollingInconsistentChainIds,
+      rollingEvidenceComplete,
+    };
+  }
+
+  return {
+    selectedTimestamp: latestAvailableTimestamp,
+    latestAvailableTimestamp,
+    freshness: makeFreshness(
+      latestAvailableTimestamp,
+      latestAvailableTimestamp,
+      "STABLE",
+      false,
+      "STABLE",
+      "Newest common daily bucket passed the cross-chain freshness checks.",
+    ),
+    severeDropChainIds,
+    rollingInconsistentChainIds,
+    rollingEvidenceComplete,
+  };
 }
 
 export function selectLatestComparableBucket(
@@ -193,8 +415,11 @@ export function selectLatestComparableBucket(
 export function buildComparableWindow(
   series: CoreMetricSeries,
   nowMs = Date.now(),
+  selectedTimestampOverride?: number | null,
 ): ComparableWindow {
-  const currentTimestamp = selectLatestComparableBucket(series, nowMs);
+  const currentTimestamp = selectedTimestampOverride === undefined
+    ? selectLatestComparableBucket(series, nowMs)
+    : selectedTimestampOverride;
   const currentByMetric = Object.fromEntries(
     CORE_METRICS.map((metric) => [metric, null]),
   ) as Record<CoreMetricName, number | null>;

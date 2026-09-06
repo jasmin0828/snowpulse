@@ -1,8 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { AvalancheChain, CoreMetricSeries, DailyMetricPoint, MetricSeries } from "../src/lib/avalanche/metrics.ts";
-import { buildComparableWindow } from "../src/lib/avalanche/metrics.ts";
+import type {
+  AvalancheChain,
+  CoreMetricSeries,
+  CoreRollingMetricSeries,
+  DailyMetricPoint,
+  MetricSeries,
+} from "../src/lib/avalanche/metrics.ts";
+import {
+  buildComparableWindow,
+  DAY_SECONDS,
+  selectStableDailyBucket,
+} from "../src/lib/avalanche/metrics.ts";
 import { classifyPattern, generateExplanation } from "../src/lib/intelligence/explain.ts";
+import { buildIntelligenceSignals } from "../src/lib/intelligence/engine.ts";
 import {
   buildChainSignal,
   buildMetricComparison,
@@ -32,6 +43,32 @@ function series(values: Record<number, number>): MetricSeries {
 
 function allSeries(values: Record<number, number>): CoreMetricSeries {
   return { txCount: series(values), activeAddresses: series(values), activeSenders: series(values) };
+}
+
+function rollingSeries(lastDay: number | null): CoreRollingMetricSeries {
+  return {
+    txCount: { lastDay, request },
+    activeAddresses: { lastDay, request },
+    activeSenders: { lastDay, request },
+  };
+}
+
+function frozenChains(): AvalancheChain[] {
+  return [4337, 432204, 43419, 46975].map((evmChainId) => ({
+    chainName: `Chain ${evmChainId}`,
+    evmChainId,
+    network: "mainnet",
+    blockchainId: `blockchain-${evmChainId}`,
+    subnetId: `subnet-${evmChainId}`,
+  }));
+}
+
+function seriesByFrozenChain(values: Record<number, number>): Record<number, CoreMetricSeries> {
+  return Object.fromEntries(frozenChains().map((frozenChain) => [frozenChain.evmChainId, allSeries(values)]));
+}
+
+function rollingByFrozenChain(lastDay: number | null): Record<number, CoreRollingMetricSeries> {
+  return Object.fromEntries(frozenChains().map((frozenChain) => [frozenChain.evmChainId, rollingSeries(lastDay)]));
 }
 
 function comparisons(txRatio: number, addressRatio: number, senderRatio: number): CoreComparisons {
@@ -77,6 +114,103 @@ test("missing baseline day is tracked without zero filling", () => {
   assert.equal(comparison.validBaselineDays, 6);
   assert.equal(comparison.missingBaselineDays, 1);
   assert.equal(comparison.baseline, 100);
+});
+
+test("newest synchronized collapse is provisional and selects the previous common bucket", () => {
+  const latest = 100 * DAY_SECONDS;
+  const values: Record<number, number> = {
+    [latest]: 100,
+    [latest - DAY_SECONDS]: 300,
+    [latest - 2 * DAY_SECONDS]: 300,
+  };
+  const selection = selectStableDailyBucket(
+    frozenChains(),
+    seriesByFrozenChain(values),
+    rollingByFrozenChain(1_000),
+    (latest + DAY_SECONDS) * 1000,
+  );
+  assert.equal(selection.latestAvailableTimestamp, latest);
+  assert.equal(selection.selectedTimestamp, latest - DAY_SECONDS);
+  assert.equal(selection.freshness.state, "STABLE");
+  assert.equal(selection.freshness.latestAvailableState, "PROVISIONAL");
+  assert.equal(selection.freshness.usedFallbackBucket, true);
+  assert.deepEqual(selection.severeDropChainIds, [4337, 432204, 43419, 46975]);
+  assert.deepEqual(selection.rollingInconsistentChainIds, [4337, 432204, 43419, 46975]);
+});
+
+test("newest bucket stays stable when the cross-chain heuristic does not trigger", () => {
+  const latest = 100 * DAY_SECONDS;
+  const values: Record<number, number> = {
+    [latest]: 300,
+    [latest - DAY_SECONDS]: 300,
+  };
+  const selection = selectStableDailyBucket(
+    frozenChains(),
+    seriesByFrozenChain(values),
+    rollingByFrozenChain(350),
+    (latest + DAY_SECONDS) * 1000,
+  );
+  assert.equal(selection.selectedTimestamp, latest);
+  assert.equal(selection.freshness.state, "STABLE");
+  assert.equal(selection.freshness.latestAvailableState, "STABLE");
+  assert.equal(selection.freshness.usedFallbackBucket, false);
+  assert.deepEqual(selection.severeDropChainIds, []);
+  assert.deepEqual(selection.rollingInconsistentChainIds, []);
+});
+
+test("missing rolling evidence uses the conservative historical-collapse fallback", () => {
+  const latest = 100 * DAY_SECONDS;
+  const values: Record<number, number> = {
+    [latest]: 100,
+    [latest - DAY_SECONDS]: 300,
+  };
+  const selection = selectStableDailyBucket(
+    frozenChains(),
+    seriesByFrozenChain(values),
+    undefined,
+    (latest + DAY_SECONDS) * 1000,
+  );
+  assert.equal(selection.selectedTimestamp, latest - DAY_SECONDS);
+  assert.equal(selection.freshness.state, "STABLE");
+  assert.equal(selection.freshness.latestAvailableState, "PROVISIONAL");
+  assert.equal(selection.rollingEvidenceComplete, false);
+});
+
+test("uncertain freshness does not silently select a bucket when rolling evidence is missing", () => {
+  const latest = 100 * DAY_SECONDS;
+  const values: Record<number, number> = {
+    [latest]: 300,
+    [latest - DAY_SECONDS]: 300,
+  };
+  const selection = selectStableDailyBucket(
+    frozenChains(),
+    seriesByFrozenChain(values),
+    undefined,
+    (latest + DAY_SECONDS) * 1000,
+  );
+  assert.equal(selection.selectedTimestamp, null);
+  assert.equal(selection.freshness.state, "UNCERTAIN");
+  assert.equal(selection.freshness.latestAvailableState, "AVAILABLE");
+});
+
+test("universe intelligence signals expose the selected bucket freshness", () => {
+  const latest = 100 * DAY_SECONDS;
+  const values: Record<number, number> = {
+    [latest]: 100,
+    [latest - DAY_SECONDS]: 300,
+  };
+  const { signals, selection } = buildIntelligenceSignals(
+    frozenChains(),
+    seriesByFrozenChain(values),
+    rollingByFrozenChain(1_000),
+    (latest + DAY_SECONDS) * 1000,
+  );
+  assert.equal(signals.length, 4);
+  assert.equal(signals[0].dataTimestamp, new Date((latest - DAY_SECONDS) * 1000).toISOString());
+  assert.equal(signals[0].freshness.state, "STABLE");
+  assert.equal(signals[0].freshness.latestAvailableTimestamp, new Date(latest * 1000).toISOString());
+  assert.equal(signals[0].freshness.usedFallbackBucket, true);
+  assert.deepEqual(signals.map((signal) => signal.freshness), signals.map(() => selection.freshness));
 });
 
 test("weak samples receive a small-base factor", () => {

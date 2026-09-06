@@ -1,4 +1,4 @@
-import type { AvalancheChain, ComparableWindow, CoreMetricName } from "../avalanche/metrics.ts";
+import type { AvalancheChain, ComparableWindow, CoreMetricName, DataFreshness } from "../avalanche/metrics.ts";
 
 export const SAMPLE_QUALITY = ["STRONG", "MEDIUM", "WEAK", "UNAVAILABLE"] as const;
 export type SampleQuality = (typeof SAMPLE_QUALITY)[number];
@@ -29,6 +29,7 @@ export type ChainSignal = {
   chainName: string;
   dataTimestamp: string;
   baselineRange: string;
+  freshness: DataFreshness;
   txCount: MetricComparison;
   activeAddresses: MetricComparison;
   activeSenders: MetricComparison;
@@ -187,6 +188,7 @@ export function buildChainSignal(
   chain: AvalancheChain,
   window: ComparableWindow,
   narrative: { headline: string; explanation: string; nextQuestion: string },
+  freshnessOverride?: DataFreshness,
 ): ChainSignal {
   const comparisons = comparisonsFromWindow(window);
   const confidence = determineConfidence(comparisons);
@@ -198,11 +200,20 @@ export function buildChainSignal(
   const baselineRange = window.baselineRangeStart === null || window.baselineRangeEnd === null
     ? "MISSING"
     : `${new Date(window.baselineRangeStart * 1000).toISOString()} to ${new Date((window.baselineRangeEnd + 86_400) * 1000).toISOString()}`;
+  const freshness = freshnessOverride ?? {
+    selectedTimestamp: dataTimestamp,
+    latestAvailableTimestamp: dataTimestamp,
+    state: "UNCERTAIN" as const,
+    usedFallbackBucket: false,
+    latestAvailableState: dataTimestamp === "MISSING" ? null : "AVAILABLE" as const,
+    reason: "No cross-chain stable-bucket assessment was supplied.",
+  };
   return {
     chainId: chain.evmChainId,
     chainName: chain.chainName,
     dataTimestamp,
     baselineRange,
+    freshness,
     ...comparisons,
     activityScore,
     status,
