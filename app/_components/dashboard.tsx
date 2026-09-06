@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, type CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
+import { scanAvalancheL1s } from "../actions";
 import type { DataFreshness } from "../../src/lib/avalanche/metrics";
 import type { DashboardData } from "../../src/lib/dashboard/types";
 import { freshnessSummary, prepareDashboardViewModel } from "../../src/lib/dashboard/view-model";
@@ -22,6 +23,15 @@ const METRIC_ITEMS = [
   { key: "txCount", label: "Transactions", shortLabel: "Tx" },
   { key: "activeAddresses", label: "Active Addresses", shortLabel: "Addresses" },
   { key: "activeSenders", label: "Active Senders", shortLabel: "Senders" },
+] as const;
+
+const SCAN_STAGES = [
+  "Connecting to Avalanche Metrics API...",
+  "Scanning Avalanche L1 activity...",
+  "Checking data freshness...",
+  "Selecting latest stable window...",
+  "Comparing against 7-day baseline...",
+  "Calculating Activity Scores...",
 ] as const;
 
 type MetricKey = (typeof METRIC_ITEMS)[number]["key"];
@@ -114,6 +124,30 @@ function EcosystemVisual() {
       </svg>
       <div className="visual-caption"><span className="caption-dot" />Four L1s · one signal surface</div>
     </div>
+  );
+}
+
+function ScanProgress({ stageIndex, error }: { stageIndex: number; error: string | null }) {
+  return (
+    <section className={`scan-progress${error ? " scan-progress-error" : ""}`} role="status" aria-live="polite">
+      <div className="scan-progress-heading">
+        <div>
+          <p className="eyebrow eyebrow-small">Live discovery workflow</p>
+          <strong>{error ? "Scan could not complete" : "Scanning Avalanche L1s"}</strong>
+        </div>
+        <span>{error ? "TRY AGAIN" : `${Math.min(stageIndex + 1, SCAN_STAGES.length)}/${SCAN_STAGES.length}`}</span>
+      </div>
+      {error ? <p className="scan-progress-message">{error}</p> : (
+        <ol className="scan-stages">
+          {SCAN_STAGES.map((stage, index) => (
+            <li key={stage} className={index < stageIndex ? "scan-stage-complete" : index === stageIndex ? "scan-stage-active" : ""}>
+              <span className="scan-stage-marker" aria-hidden="true">{index < stageIndex ? "✓" : index + 1}</span>
+              <span>{stage}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
   );
 }
 
@@ -268,10 +302,41 @@ function DataQualityState({ sourceState }: { sourceState: DashboardData["sourceS
   );
 }
 
-export default function Dashboard({ data }: { data: DashboardData }) {
-  const viewModel = prepareDashboardViewModel(data.signals, data.freshness);
-  const [selectedChainId, setSelectedChainId] = useState(viewModel.rankedSignals[0]?.chainId ?? null);
-  const selectedSignal = viewModel.rankedSignals.find((signal) => signal.chainId === selectedChainId) ?? viewModel.rankedSignals[0] ?? null;
+export default function Dashboard({ data: initialData }: { data?: DashboardData }) {
+  const [data, setData] = useState<DashboardData | null>(initialData ?? null);
+  const [isScanning, setIsScanning] = useState(false);
+  const [scanStageIndex, setScanStageIndex] = useState(0);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const viewModel = data ? prepareDashboardViewModel(data.signals, data.freshness) : null;
+  const rankedSignals = viewModel?.rankedSignals ?? [];
+  const withholdRanking = viewModel?.withholdRanking ?? false;
+  const [selectedChainId, setSelectedChainId] = useState<number | null>(rankedSignals[0]?.chainId ?? null);
+  const selectedSignal = viewModel?.rankedSignals.find((signal) => signal.chainId === selectedChainId) ?? viewModel?.rankedSignals[0] ?? null;
+
+  useEffect(() => {
+    if (!isScanning) return;
+    const timer = window.setInterval(() => {
+      setScanStageIndex((current) => Math.min(current + 1, SCAN_STAGES.length - 1));
+    }, 750);
+    return () => window.clearInterval(timer);
+  }, [isScanning]);
+
+  function handleScan() {
+    if (isScanning) return;
+    setData(null);
+    setScanError(null);
+    setScanStageIndex(0);
+    setIsScanning(true);
+    void scanAvalancheL1s()
+      .then((nextData) => {
+        setData(nextData);
+        setSelectedChainId(null);
+      })
+      .catch(() => {
+        setScanError("The Avalanche Metrics API request did not complete. Try scanning again.");
+      })
+      .finally(() => setIsScanning(false));
+  }
 
   return (
     <main className="dashboard-shell">
@@ -283,8 +348,8 @@ export default function Dashboard({ data }: { data: DashboardData }) {
           <span className="brand-descriptor">Avalanche L1 Activity Intelligence</span>
         </a>
         <div className="topbar-meta">
-          <span className="live-indicator"><span className="live-dot" />{data.sourceState}</span>
-          <span>{data.monitoredL1Count} L1s monitored</span>
+          {data ? <span className="live-indicator"><span className="live-dot" />{data.sourceState}</span> : <span className="live-indicator"><span className="live-dot" />READY TO SCAN</span>}
+          <span>{data?.monitoredL1Count ?? 4} L1s monitored</span>
         </div>
       </nav>
 
@@ -295,21 +360,29 @@ export default function Dashboard({ data }: { data: DashboardData }) {
             <h1 id="page-title">Where is activity <em>moving</em> across Avalanche?</h1>
             <p className="hero-lede">SnowPulse compares activity across Avalanche L1s and surfaces the networks showing the most meaningful changes.</p>
             <div className="hero-proof"><span className="proof-line" />Many Avalanche L1s <b>→</b> Detect change <b>→</b> Surface signal</div>
+            <div className="hero-actions">
+              <button className="scan-button" type="button" data-testid="scan-button" onClick={handleScan} disabled={isScanning} aria-busy={isScanning}>
+                <span className={`scan-button-icon${isScanning ? " scan-button-icon-spinning" : ""}`} aria-hidden="true" />
+                {isScanning ? "Scanning Avalanche L1s..." : "Scan Avalanche L1s"}
+              </button>
+              <span className="scan-note">Uses the real Avalanche Metrics API workflow.</span>
+            </div>
+            {isScanning || scanError ? <ScanProgress stageIndex={scanStageIndex} error={scanError} /> : null}
           </div>
           <EcosystemVisual />
         </section>
 
-        <FreshnessStrip freshness={data.freshness} sourceState={data.sourceState} />
+        {data ? <FreshnessStrip freshness={data.freshness} sourceState={data.sourceState} /> : null}
 
         <section className="signals-section" aria-labelledby="signals-title">
           <div className="section-heading">
             <div><p className="eyebrow">Discovery layer</p><h2 id="signals-title">Activity Signals</h2></div>
             <p>Ranked by change in transactions and participant activity<br className="desktop-break" /> versus the prior 7-day baseline.</p>
           </div>
-          {viewModel.withholdRanking ? <DataQualityState sourceState={data.sourceState} /> : (
+          {!data ? <div className="ready-state" role="status"><span className="ready-icon" aria-hidden="true">↗</span><div><strong>Ready to scan the Avalanche L1 universe.</strong><p>Run the live discovery workflow to reveal ranked activity signals.</p></div></div> : withholdRanking ? <DataQualityState sourceState={data.sourceState} /> : (
             <div className="signals-layout">
               <div className="signals-list" aria-label="Ranked Avalanche L1 activity signals">
-                {viewModel.rankedSignals.map((signal, index) => (
+                {rankedSignals.map((signal, index) => (
                   <SignalRow
                     key={signal.chainId}
                     signal={signal}
