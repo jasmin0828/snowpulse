@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test": "node --experimental-strip-types --experimental-default-type=module --test tests/intelligence.test.ts",
+    "test": "node --experimental-strip-types --experimental-default-type=module --test tests/intelligence.test.ts tests/dashboard.test.ts",
     "gate2": "node --experimental-strip-types --experimental-default-type=module scripts/gate2-intelligence.ts"
   },
   "dependencies": {
